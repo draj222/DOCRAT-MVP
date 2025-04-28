@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: docrat-api
+    env: docker
+    plan: free
+    branch: main
+    autoDeploy: true
+    serviceRequestTimeoutSeconds: 300
+    envVars:
+      - key: OPENAI_API_KEY
+        fromSecret: OPENAI_API_KEY
+      - key: REDIS_URL
+        fromSecret: REDIS_URL
