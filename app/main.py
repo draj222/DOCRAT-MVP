@@ -1,5 +1,6 @@
 # app/main.py
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Any, Optional
 import os
@@ -18,6 +19,19 @@ app = FastAPI(
     title="DocRAT API",
     description="API for processing YouTube videos and extracting meeting insights",
     version="0.1.0"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://www.sariphi.ai",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 class VideoRequest(BaseModel):
