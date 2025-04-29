@@ -4,3 +4,7 @@ openai==0.27.8
 python-dotenv==1.0.0
 redis==4.6.0
 youtube_transcript_api==0.6.1
+pytest==7.3.1
+httpx==0.24.1
+pytest-asyncio==0.21.0
+aioredis==2.0.1

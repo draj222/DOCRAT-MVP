@@ -1,2 +1,12 @@
 __pycache__/
 .env
+.env.*
+!.env.example
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+.vscode/
+.idea/
+*.log
+static/
