@@ -10,14 +10,47 @@ from urllib.parse import urlparse, parse_qs
 
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from youtube_transcript_api.formatters import TextFormatter
-import openai
+from openai import OpenAI, AsyncOpenAI
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
-# Set OpenAI API key from environment variables
-openai.api_key = os.environ.get("OPENAI_API_KEY", "")
+# Initialize OpenAI client with API key from environment variables
+api_key = os.environ.get("OPENAI_API_KEY", "")
+if not api_key:
+    print("WARNING: No OpenAI API key found in environment variables")
+
+# Try to initialize client without organization ID first
+try:
+    client = OpenAI(api_key=api_key)
+    async_client = AsyncOpenAI(api_key=api_key)
+    print(f"OpenAI API key configured: {'Yes' if api_key else 'No'} (key type: {'Project-scoped' if api_key.startswith('sk-proj-') else 'Standard' if api_key.startswith('sk-') else 'Unknown'})")
+    print("Successfully initialized OpenAI client without organization ID")
+except Exception as e:
+    print(f"Error initializing OpenAI client without organization ID: {e}")
+    
+    # If that fails and it's a project key, try with an organization ID
+    if api_key.startswith('sk-proj-'):
+        try:
+            # Try parsing the parts after "sk-proj-" using hyphens
+            parts = api_key[8:].split('-')
+            
+            # Project ID is usually found in the first part 
+            if parts and len(parts) > 0:
+                org_id = parts[0]  # Use the first segment as org ID
+                print(f"Trying with extracted organization ID: {org_id}")
+                
+                client = OpenAI(api_key=api_key, organization=org_id)
+                async_client = AsyncOpenAI(api_key=api_key, organization=org_id)
+                print(f"Successfully initialized OpenAI client with organization ID: {org_id}")
+        except Exception as e2:
+            print(f"Error initializing OpenAI client with organization ID: {e2}")
+            client = None
+            async_client = None
+    else:
+        client = None
+        async_client = None
 
 # Status constants
 STATUS_PENDING = "pending"
@@ -201,8 +234,9 @@ Format your response as a JSON object with these keys:
 """
 
     try:
-        response = await openai.ChatCompletion.acreate(
-            model="gpt-4",
+        print(f"Attempting to call OpenAI API for video {video_id}, segment {start_formatted}-{end_formatted}")
+        response = await async_client.chat.completions.create(
+            model="gpt-3.5-turbo-1106",  # This model supports JSON response format
             messages=[
                 {"role": "system", "content": "You are an assistant that extracts insights from meeting transcripts."},
                 {"role": "user", "content": prompt}
@@ -212,6 +246,7 @@ Format your response as a JSON object with these keys:
         )
         
         content = response.choices[0].message.content
+        print(f"Successfully received OpenAI response for video {video_id}, segment {start_formatted}-{end_formatted}")
         
         # Parse response as JSON
         result = json.loads(content)
@@ -231,6 +266,7 @@ Format your response as a JSON object with these keys:
         
         return result
     except Exception as e:
+        print(f"Error calling OpenAI API: {str(e)}")
         # In case of error, return minimal data
         error_result = {
             "start": start_formatted,
