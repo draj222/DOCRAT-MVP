@@ -3,8 +3,10 @@ import os
 import re
 import json
 import time
+import logging
 from typing import Dict, List, Any, Optional, Tuple
 import asyncio
+import tempfile
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 
@@ -12,6 +14,12 @@ from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, No
 from youtube_transcript_api.formatters import TextFormatter
 from openai import OpenAI, AsyncOpenAI
 from dotenv import load_dotenv
+import pytube
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, 
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -19,16 +27,16 @@ load_dotenv()
 # Initialize OpenAI client with API key from environment variables
 api_key = os.environ.get("OPENAI_API_KEY", "")
 if not api_key:
-    print("WARNING: No OpenAI API key found in environment variables")
+    logger.warning("WARNING: No OpenAI API key found in environment variables")
 
 # Try to initialize client without organization ID first
 try:
     client = OpenAI(api_key=api_key)
     async_client = AsyncOpenAI(api_key=api_key)
-    print(f"OpenAI API key configured: {'Yes' if api_key else 'No'} (key type: {'Project-scoped' if api_key.startswith('sk-proj-') else 'Standard' if api_key.startswith('sk-') else 'Unknown'})")
-    print("Successfully initialized OpenAI client without organization ID")
+    logger.info(f"OpenAI API key configured: {'Yes' if api_key else 'No'} (key type: {'Project-scoped' if api_key.startswith('sk-proj-') else 'Standard' if api_key.startswith('sk-') else 'Unknown'})")
+    logger.info("Successfully initialized OpenAI client without organization ID")
 except Exception as e:
-    print(f"Error initializing OpenAI client without organization ID: {e}")
+    logger.error(f"Error initializing OpenAI client without organization ID: {e}")
     
     # If that fails and it's a project key, try with an organization ID
     if api_key.startswith('sk-proj-'):
@@ -39,13 +47,13 @@ except Exception as e:
             # Project ID is usually found in the first part 
             if parts and len(parts) > 0:
                 org_id = parts[0]  # Use the first segment as org ID
-                print(f"Trying with extracted organization ID: {org_id}")
+                logger.info(f"Trying with extracted organization ID: {org_id}")
                 
                 client = OpenAI(api_key=api_key, organization=org_id)
                 async_client = AsyncOpenAI(api_key=api_key, organization=org_id)
-                print(f"Successfully initialized OpenAI client with organization ID: {org_id}")
+                logger.info(f"Successfully initialized OpenAI client with organization ID: {org_id}")
         except Exception as e2:
-            print(f"Error initializing OpenAI client with organization ID: {e2}")
+            logger.error(f"Error initializing OpenAI client with organization ID: {e2}")
             client = None
             async_client = None
     else:
@@ -84,15 +92,85 @@ def format_time(seconds: int) -> str:
     minutes, seconds = divmod(remainder, 60)
     return f"{int(hours):02}:{int(minutes):02}:{int(seconds):02}"
 
+def fallback_whisper(video_id: str) -> List[Dict[str, Any]]:
+    """Download YouTube audio and transcribe using OpenAI Whisper when captions aren't available."""
+    logger.info(f"Attempting Whisper fallback for video {video_id}")
+    
+    # Check if OpenAI client is available
+    if not client or not api_key:
+        logger.error("Cannot use Whisper fallback - no OpenAI API key configured")
+        return []
+    
+    try:
+        # Download audio from YouTube using pytube
+        yt = pytube.YouTube(f"https://www.youtube.com/watch?v={video_id}")
+        audio_stream = yt.streams.filter(only_audio=True).first()
+        
+        if not audio_stream:
+            logger.warning(f"No audio stream found for video {video_id}")
+            return []
+            
+        # Create a temporary file to save the audio
+        temp_dir = tempfile.gettempdir()
+        temp_file_path = os.path.join(temp_dir, f"{video_id}.mp4")
+        
+        # Download the audio
+        logger.info(f"Downloading audio for video {video_id}")
+        audio_stream.download(output_path=temp_dir, filename=f"{video_id}.mp4")
+        
+        # Transcribe with Whisper
+        logger.info(f"Transcribing audio using Whisper for video {video_id}")
+        with open(temp_file_path, "rb") as audio_file:
+            response = client.audio.transcriptions.create(
+                file=audio_file,
+                model="whisper-1",
+                response_format="verbose_json"
+            )
+        
+        # Clean up the temporary file
+        try:
+            os.remove(temp_file_path)
+        except Exception as e:
+            logger.warning(f"Failed to remove temporary file {temp_file_path}: {e}")
+        
+        # Format the response into a transcript-like format
+        # Whisper response contains segments with start, end times and text
+        transcript = []
+        if hasattr(response, 'segments'):
+            for segment in response.segments:
+                transcript.append({
+                    'start': segment.start,
+                    'duration': segment.end - segment.start,
+                    'text': segment.text
+                })
+        else:
+            # If no segments, create a single entry with the full text
+            transcript.append({
+                'start': 0.0,
+                'duration': 0.0,  # We don't know the duration
+                'text': response.text
+            })
+        
+        logger.info(f"Successfully transcribed video {video_id} using Whisper")
+        return transcript
+        
+    except Exception as e:
+        logger.error(f"Error in Whisper fallback for video {video_id}: {str(e)}")
+        return []
+
 def get_transcript(video_id: str, redis_client=None) -> List[Dict[str, Any]]:
-    """Get transcript for a YouTube video with caching."""
+    """Get transcript for a YouTube video with caching and Whisper fallback."""
     # Check cache first
     if redis_client and redis_client.exists(f"transcript:{video_id}"):
+        logger.info(f"Found cached transcript for video {video_id}")
         transcript_json = redis_client.get(f"transcript:{video_id}")
         return json.loads(transcript_json)
     
     try:
+        # Try to get YouTube transcript first
+        logger.info(f"Fetching YouTube transcript for video {video_id}")
         transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        logger.info(f"Successfully fetched YouTube transcript for video {video_id}")
         
         # Cache the transcript with TTL of 1 week (604800 seconds)
         if redis_client:
@@ -101,24 +179,68 @@ def get_transcript(video_id: str, redis_client=None) -> List[Dict[str, Any]]:
                 604800, 
                 json.dumps(transcript)
             )
+            logger.info(f"Cached YouTube transcript for video {video_id}")
         
+        # Clear any existing error for this video since we succeeded
+        if redis_client and redis_client.exists(f"error:{video_id}"):
+            redis_client.delete(f"error:{video_id}")
+            logger.info(f"Deleted existing error:{video_id} key after successful transcript fetch")
+            
         return transcript
     except (TranscriptsDisabled, NoTranscriptFound) as e:
-        # Handle the case where transcript is not available
-        if redis_client:
-            redis_client.setex(
-                f"error:{video_id}", 
-                86400,  # 1 day in seconds
-                f"Transcript not available: {str(e)}"
-            )
-        return []
+        logger.warning(f"YouTube transcript not available for video {video_id}: {str(e)}")
+        
+        # Clear any existing error for this video
+        if redis_client and redis_client.exists(f"error:{video_id}"):
+            redis_client.delete(f"error:{video_id}")
+            logger.info(f"Deleted existing error:{video_id} key")
+        
+        # Try Whisper fallback
+        fallback_transcript = fallback_whisper(video_id)
+        
+        if fallback_transcript:
+            # Cache the fallback transcript
+            if redis_client:
+                redis_client.setex(
+                    f"transcript:{video_id}", 
+                    604800,  # 1 week in seconds
+                    json.dumps(fallback_transcript)
+                )
+                logger.info(f"Cached Whisper transcript for video {video_id}")
+            return fallback_transcript
+        else:
+            error_msg = "Failed to get transcript: No captions available and Whisper fallback failed or unavailable"
+            logger.error(error_msg)
+            
+            # If fallback also failed, set error
+            if redis_client:
+                redis_client.setex(
+                    f"error:{video_id}", 
+                    86400,  # 1 day in seconds
+                    error_msg
+                )
+                redis_client.setex(
+                    f"status:{video_id}",
+                    86400,  # 1 day in seconds
+                    STATUS_ERROR
+                )
+                logger.warning(f"Set error and status keys for video {video_id}: both YouTube and Whisper failed")
+            return []
     except Exception as e:
+        error_msg = f"Unexpected error fetching transcript for video {video_id}: {str(e)}"
+        logger.error(error_msg)
         if redis_client:
             redis_client.setex(
                 f"error:{video_id}", 
                 86400,  # 1 day in seconds
-                f"Error fetching transcript: {str(e)}"
+                error_msg
             )
+            redis_client.setex(
+                f"status:{video_id}",
+                86400,  # 1 day in seconds
+                STATUS_ERROR
+            )
+            logger.warning(f"Set error and status keys for video {video_id}: {str(e)}")
         return []
 
 def get_video_info(video_id: str, redis_client=None) -> Dict[str, Any]:
@@ -132,13 +254,13 @@ def get_video_info(video_id: str, redis_client=None) -> Dict[str, Any]:
         # For a full implementation, you would use youtube_dl or yt-dlp here
         # For this MVP, we'll use a simple mock that returns basic information
         video_info = {
-            "id": video_id,
-            "title": f"Video {video_id}",
+        "id": video_id,
+        "title": f"Video {video_id}",
             "duration": "Unknown",  # Will be calculated from transcript
             "uploader": "YouTube Creator",
-            "upload_date": datetime.now().strftime("%Y-%m-%d"),
-            "thumbnail": f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
-        }
+        "upload_date": datetime.now().strftime("%Y-%m-%d"),
+        "thumbnail": f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
+    }
         
         # Cache the video info with TTL of 1 week (604800 seconds)
         if redis_client:
@@ -278,7 +400,7 @@ Format your response as a JSON object with these keys:
             "actions": [],
             "summary": f"Error extracting insights: {str(e)}"
         }
-        
+
         # Still cache the error result to avoid repeated failures
         if redis_client and video_id:
             redis_client.setex(
@@ -292,32 +414,77 @@ Format your response as a JSON object with these keys:
 async def process_video(video_id: str, chunk_size_minutes: int = 10, redis_client=None):
     """Process a video by chunking transcript and extracting insights."""
     try:
+        logger.info(f"Starting to process video {video_id} with chunk size {chunk_size_minutes} minutes")
+        
+        # Log Redis connection status
+        if redis_client:
+            try:
+                redis_client.ping()
+                logger.info(f"Redis connection is active for video {video_id}")
+            except Exception as e:
+                logger.error(f"Redis connection error for video {video_id}: {str(e)}")
+        else:
+            logger.warning(f"No Redis client provided for video {video_id}")
+        
+        # Clear any existing error or status for this video
+        if redis_client:
+            for key in [f"error:{video_id}", f"status:{video_id}"]:
+                try:
+                    if redis_client.exists(key):
+                        redis_client.delete(key)
+                        logger.info(f"Deleted existing {key} key to start fresh")
+                except Exception as e:
+                    logger.error(f"Error deleting Redis key {key}: {str(e)}")
+        
         # Mark as processing
         if redis_client:
-            redis_client.setex(f"processing:{video_id}", 3600, STATUS_PROCESSING)
+            try:
+                redis_client.setex(f"status:{video_id}", 3600, STATUS_PROCESSING)
+                logger.info(f"Set status:{video_id} to {STATUS_PROCESSING}")
+                redis_client.setex(f"processing:{video_id}", 3600, STATUS_PROCESSING)
+                logger.info(f"Set processing:{video_id} key")
+            except Exception as e:
+                logger.error(f"Error setting processing status for video {video_id}: {str(e)}")
         
         # Check if already processed
-        if redis_client and redis_client.exists(f"processed_video:{video_id}"):
-            video_json = redis_client.get(f"processed_video:{video_id}")
-            
-            # Mark as completed
-            redis_client.setex(f"status:{video_id}", 604800, STATUS_COMPLETED)
-            
-            # Remove processing flag
-            redis_client.delete(f"processing:{video_id}")
-            
-            return json.loads(video_json)
+        if redis_client:
+            try:
+                if redis_client.exists(f"processed_video:{video_id}"):
+                    video_json = redis_client.get(f"processed_video:{video_id}")
+                    
+                    # Mark as completed
+                    redis_client.setex(f"status:{video_id}", 604800, STATUS_COMPLETED)
+                    logger.info(f"Set status:{video_id} to {STATUS_COMPLETED} (already processed)")
+                    
+                    # Remove processing flag
+                    redis_client.delete(f"processing:{video_id}")
+                    logger.info(f"Deleted processing:{video_id} key (already processed)")
+                    
+                    logger.info(f"Returning cached results for video {video_id}")
+                    return json.loads(video_json)
+            except Exception as e:
+                logger.error(f"Error checking if video {video_id} was already processed: {str(e)}")
         
         # Get transcript
+        logger.info(f"Requesting transcript for video {video_id}")
         transcript = get_transcript(video_id, redis_client)
         
         if not transcript:
             error_msg = "No transcript available for this video"
+            logger.error(f"{error_msg} for video {video_id}")
             if redis_client:
-                redis_client.setex(f"error:{video_id}", 86400, error_msg)
-                redis_client.setex(f"status:{video_id}", 86400, STATUS_ERROR)
-                redis_client.delete(f"processing:{video_id}")
+                try:
+                    redis_client.setex(f"error:{video_id}", 86400, error_msg)
+                    logger.info(f"Set error:{video_id} to '{error_msg}'")
+                    redis_client.setex(f"status:{video_id}", 86400, STATUS_ERROR)
+                    logger.info(f"Set status:{video_id} to {STATUS_ERROR}")
+                    redis_client.delete(f"processing:{video_id}")
+                    logger.info(f"Deleted processing:{video_id} key")
+                except Exception as e:
+                    logger.error(f"Error setting error status for video {video_id}: {str(e)}")
             raise Exception(error_msg)
+        
+        logger.info(f"Successfully retrieved transcript for video {video_id} with {len(transcript)} segments")
         
         # Get video info
         video_info = get_video_info(video_id, redis_client)
@@ -368,18 +535,22 @@ async def process_video(video_id: str, chunk_size_minutes: int = 10, redis_clien
                 604800,  # 1 week in seconds
                 json.dumps(final_result)
             )
+            logger.info(f"Cached processed_video:{video_id}")
             
             # Mark as completed
             redis_client.setex(f"status:{video_id}", 604800, STATUS_COMPLETED)
+            logger.info(f"Set status:{video_id} to {STATUS_COMPLETED}")
             
             # Remove processing flag
             redis_client.delete(f"processing:{video_id}")
+            logger.info(f"Deleted processing:{video_id} key")
         
         return final_result
     
     except Exception as e:
         # Handle errors
         error_message = str(e)
+        logger.error(f"Error in process_video for {video_id}: {error_message}")
         if redis_client:
             # Store error
             redis_client.setex(
@@ -387,12 +558,15 @@ async def process_video(video_id: str, chunk_size_minutes: int = 10, redis_clien
                 86400,  # 1 day in seconds
                 error_message
             )
+            logger.info(f"Set error:{video_id} to '{error_message}'")
             
             # Mark as error
             redis_client.setex(f"status:{video_id}", 86400, STATUS_ERROR)
+            logger.info(f"Set status:{video_id} to {STATUS_ERROR}")
             
             # Remove processing flag
             redis_client.delete(f"processing:{video_id}")
+            logger.info(f"Deleted processing:{video_id} key")
         
         raise Exception(f"Error processing video {video_id}: {error_message}")
 
