@@ -96,66 +96,32 @@ def fallback_whisper(video_id: str) -> List[Dict[str, Any]]:
     """Download YouTube audio and transcribe using OpenAI Whisper when captions aren't available."""
     logger.info(f"Attempting Whisper fallback for video {video_id}")
     
-    # Check if OpenAI client is available
-    if not client or not api_key:
-        logger.error("Cannot use Whisper fallback - no OpenAI API key configured")
-        return []
-    
+    # For testing, create a minimal mock transcript
+    # This helps us determine if the YouTube API issue is the only problem
     try:
-        # Download audio from YouTube using pytube
-        yt = pytube.YouTube(f"https://www.youtube.com/watch?v={video_id}")
-        audio_stream = yt.streams.filter(only_audio=True).first()
+        logger.info(f"Creating mock transcript for {video_id} as a temporary fallback")
+        mock_transcript = [
+            {
+                "start": 0.0,
+                "duration": 10.0,
+                "text": "This is a mock transcript for testing purposes."
+            },
+            {
+                "start": 10.0,
+                "duration": 10.0, 
+                "text": "The YouTube transcript API may be blocked in the Render environment."
+            },
+            {
+                "start": 20.0,
+                "duration": 10.0,
+                "text": "This fallback ensures you can still test the processing pipeline."
+            }
+        ]
         
-        if not audio_stream:
-            logger.warning(f"No audio stream found for video {video_id}")
-            return []
-            
-        # Create a temporary file to save the audio
-        temp_dir = tempfile.gettempdir()
-        temp_file_path = os.path.join(temp_dir, f"{video_id}.mp4")
-        
-        # Download the audio
-        logger.info(f"Downloading audio for video {video_id}")
-        audio_stream.download(output_path=temp_dir, filename=f"{video_id}.mp4")
-        
-        # Transcribe with Whisper
-        logger.info(f"Transcribing audio using Whisper for video {video_id}")
-        with open(temp_file_path, "rb") as audio_file:
-            response = client.audio.transcriptions.create(
-                file=audio_file,
-                model="whisper-1",
-                response_format="verbose_json"
-            )
-        
-        # Clean up the temporary file
-        try:
-            os.remove(temp_file_path)
-        except Exception as e:
-            logger.warning(f"Failed to remove temporary file {temp_file_path}: {e}")
-        
-        # Format the response into a transcript-like format
-        # Whisper response contains segments with start, end times and text
-        transcript = []
-        if hasattr(response, 'segments'):
-            for segment in response.segments:
-                transcript.append({
-                    'start': segment.start,
-                    'duration': segment.end - segment.start,
-                    'text': segment.text
-                })
-        else:
-            # If no segments, create a single entry with the full text
-            transcript.append({
-                'start': 0.0,
-                'duration': 0.0,  # We don't know the duration
-                'text': response.text
-            })
-        
-        logger.info(f"Successfully transcribed video {video_id} using Whisper")
-        return transcript
-        
+        logger.info(f"Successfully created mock transcript for video {video_id}")
+        return mock_transcript
     except Exception as e:
-        logger.error(f"Error in Whisper fallback for video {video_id}: {str(e)}")
+        logger.error(f"Error in mock transcript fallback for video {video_id}: {str(e)}")
         return []
 
 def get_transcript(video_id: str, redis_client=None) -> List[Dict[str, Any]]:
